@@ -1,120 +1,135 @@
-# Model Drift Monitoring
+# Model Drift Control Plane
 
-A persistent monitoring service for **feature drift and prediction-score drift**. The repository turns a pair of statistical functions into a small production-shaped system with baseline registration, historical monitoring runs, severity policies, REST APIs, Docker packaging, tests and CI.
+[![CI](https://github.com/cagataykavas/model-drift-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/cagataykavas/model-drift-monitoring/actions/workflows/ci.yml)
 
-## Architecture
+A persistent monitoring service for **versioned feature baselines, numeric and categorical drift, prediction drift, delayed-label performance, multiple-testing control and operational alert lifecycle**.
+
+This repository separates three questions that toy drift scripts usually collapse:
+
+1. Did the input or score distribution change?
+2. Did model quality change once labels arrived?
+3. Is the signal persistent enough to page a human?
+
+## Control-plane architecture
 
 ```mermaid
-flowchart LR
-    TRAIN[Training / validation data] --> BASE[Baseline registry]
-    PROD[Production batches] --> API[Monitoring API]
-    BASE --> API
-    API --> PSI[PSI]
-    API --> KS[Kolmogorov-Smirnov]
-    PSI --> POLICY[Severity policy]
-    KS --> POLICY
-    POLICY --> HIST[(Monitoring history)]
-    POLICY --> ALERT{stable / warning / alert}
-    ALERT --> OBS[Dashboard / pager / retraining workflow]
+flowchart TD
+    T[Training snapshot] --> B[(Versioned baselines)]
+    W[Production window] --> E[Drift evaluation]
+    B --> E
+    E --> F[FDR correction]
+    F --> H[(Run history)]
+    F --> A[Alert state machine]
+    P[Predictions] --> J[Delayed-label join]
+    L[Labels] --> J
+    J --> Q[(Performance history)]
+    A --> M[Metrics / operator]
 ```
 
-## Metrics
+## Statistical surface
 
-### Population Stability Index
+| Data kind | Metrics | Important behavior |
+|---|---|---|
+| Numeric | PSI, two-sample KS, normalized Wasserstein, missing-rate delta | reference quantile bins, constant-baseline safety, finite-value validation |
+| Categorical | Jensen–Shannon divergence, unseen-category rate, missing-rate delta | explicit missing bucket and new category detection |
+| Prediction score | numeric drift metrics | version-scoped baseline; no accuracy inference without labels |
+| Delayed labels | Brier, log-loss, ROC AUC, accuracy, precision, recall, ECE | entity-key join; single-class AUC is reported as unavailable |
 
-PSI compares the proportions of observations that fall into reference-derived bins. The project uses quantile bins from the baseline distribution and clips zero-probability buckets for numerical stability.
+When a window evaluates several numeric features, KS p-values are corrected together using **Benjamini–Hochberg**. Effect-size metrics still remain visible. This reduces the “monitor 100 columns, eventually page on random p-values” failure mode.
 
-Typical demo policy:
+## Baseline governance
 
-- `PSI < 0.10` → stable
-- `0.10 <= PSI < 0.25` → warning
-- `PSI >= 0.25` → alert
+A baseline identity is `(model_id, model_version, feature_name, feature_kind)`. Registration stores canonical content fingerprints and never silently overwrites history:
 
-Thresholds are configurable per evaluation request rather than hard-coded into the service contract.
+- the same fingerprint is an idempotent replay;
+- changed content creates a new baseline version;
+- exactly one baseline is active per model/version/feature;
+- a kind mismatch is rejected;
+- every monitoring run records the baseline ID it used;
+- a repeated window ID returns a conflict instead of double-counting evidence.
 
-### Kolmogorov-Smirnov test
+## Alert lifecycle
 
-The two-sample KS statistic measures the maximum distance between empirical cumulative distributions. It is reported next to PSI because relying on one drift metric alone is rarely enough.
+```mermaid
+stateDiagram-v2
+    [*] --> Pending
+    Pending --> Open: consecutive breaches
+    Pending --> Pending: stable or single breach
+    Resolved --> Open: consecutive breaches
+    Open --> Acknowledged: operator action
+    Open --> Resolved: consecutive stable windows
+    Acknowledged --> Resolved: consecutive stable windows
+    Resolved --> Open: later recurrence
+```
 
-### Prediction drift
+A single noisy window can be stored without paging. Default policy opens after two consecutive warning/alert windows and resolves after two stable windows. Recurrence count, breach/stable streaks, first/last seen time, acknowledgement and resolution are durable.
 
-Prediction-score monitoring also records changes in the mean predicted score. This is useful when an input feature appears stable while model outputs move materially.
+## API
 
-## API workflow
-
-Start the service:
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/v1/baselines` | register/activate a content-addressed baseline |
+| `POST` | `/v1/windows/evaluate` | evaluate up to 200 features with FDR control |
+| `GET` | `/v1/models/{id}/versions/{version}/features/{feature}/history` | baseline-linked history |
+| `POST` | `/v1/predictions` | ingest scored entities and event time |
+| `POST` | `/v1/labels` | ingest labels when they become observable |
+| `POST` | `/v1/models/{id}/versions/{version}/performance/{window}/evaluate` | join and score delayed labels |
+| `GET` | `/v1/alerts` | filterable alert registry |
+| `POST` | `/v1/alerts/{key}/acknowledge` | operator acknowledgement |
+| `GET` | `/metrics` | Prometheus evaluation and active-alert metrics |
 
 ```bash
 pip install -e '.[dev]'
 uvicorn monitoring.api:app --reload
 ```
 
-Register a reference distribution:
+The FastAPI app is constructed through `create_app(store)`, so tests do not mutate module globals or leak state between databases.
+
+## Reproducible evidence
 
 ```bash
-curl -X PUT http://localhost:8000/models/fraud-v1/baselines/amount_zscore \
-  -H 'content-type: application/json' \
-  -d '{"values": [0.1, -0.2, 0.4, 0.7, 0.0, ...]}'
+drift-reference \
+  --database artifacts/reference.db \
+  --output artifacts/reference-report.json
 ```
 
-Evaluate a production batch:
+The deterministic scenario registers three credit-risk baselines, evaluates two strongly shifted multi-feature windows, opens persistent alerts, joins 200 delayed labels and writes the drift plus performance evidence as JSON. CI executes the command from an installed wheel outside the source checkout and uploads `drift-control-plane-evidence`.
 
-```bash
-curl -X POST http://localhost:8000/models/fraud-v1/evaluate/amount_zscore \
-  -H 'content-type: application/json' \
-  -d '{
-    "values": [0.8, 1.2, 0.9, 1.5, ...],
-    "psi_warning": 0.10,
-    "psi_alert": 0.25
-  }'
-```
+The artifact proves deterministic control-flow and metric regressions. It is not presented as production prevalence, model quality or latency evidence.
 
-Inspect recent runs:
-
-```bash
-curl http://localhost:8000/models/fraud-v1/history/amount_zscore
-```
-
-## Why persistence matters
-
-A drift calculation by itself answers only “is this batch different?” Monitoring needs history:
-
-- Was the change sudden or gradual?
-- Has the feature been in warning state for several windows?
-- Did a deployment coincide with the shift?
-- Did prediction drift appear before label-quality degradation became measurable?
-
-The service therefore stores every monitoring report with a model ID, feature name, severity and timestamp.
-
-## Repository layout
+## Repository map
 
 ```text
-model-drift-monitoring/
-├── monitoring/
-│   ├── api.py
-│   └── store.py
-├── tests/
-│   └── test_monitoring_api.py
-├── drift.py
-├── Dockerfile
-├── pyproject.toml
-└── .github/workflows/ci.yml
+monitoring/models.py       typed identities, metrics, reports and alert states
+monitoring/metrics.py      numeric/categorical statistics and FDR correction
+monitoring/performance.py  delayed-label classification and calibration metrics
+monitoring/engine.py       feature evaluation and multi-feature correction
+monitoring/store.py        version registry, runs, labels and alert state
+monitoring/api.py          app factory and versioned HTTP contract
+monitoring/demo.py         deterministic evidence producer
+tests/                     statistics, persistence, API and lifecycle tests
 ```
 
-## Production extensions
+`drift.py` remains as a small compatibility/example module; production behavior lives in the package.
 
-The public version intentionally stays easy to run locally. Natural extensions include:
+## Container and CI
 
-- Prometheus metrics and Alertmanager rules;
-- scheduled windows from Kafka/Kinesis/Pub/Sub;
-- Evidently-style HTML reports;
-- data-quality checks before drift evaluation;
-- label-delayed performance monitoring;
-- calibration drift;
-- segment-specific baselines;
-- S3/GCS baseline artifacts;
-- automatic retraining tickets rather than automatic retraining by default.
+The multi-stage image builds a wheel, installs only runtime dependencies, runs as UID `10001`, owns its `/data` volume and exposes a real healthcheck. CI verifies:
 
-## Interview topics demonstrated
+- Ruff lint and format;
+- 20 behavioral tests;
+- sdist/wheel build;
+- isolated wheel installation and JSON evidence;
+- container build and live health probe.
 
-`data drift` · `concept drift` · `PSI` · `KS test` · `prediction drift` · `baseline registry` · `monitoring windows` · `alert thresholds` · `observability` · `retraining triggers` · `MLOps`
+```bash
+ruff check .
+ruff format --check .
+pytest -q
+python -m build
+docker build -t model-drift-monitoring .
+```
+
+## Honest boundaries
+
+Automatic retraining is deliberately not triggered from a drift score. Drift can reflect upstream breakage, seasonality, policy changes or genuine population movement. This control plane records evidence and creates an operator-owned alert; model promotion remains a separate governed workflow.

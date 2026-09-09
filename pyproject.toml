@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "model-drift-monitoring"
-version = "0.2.0"
-description = "Model and feature drift monitoring service with persistent baselines"
+version = "0.3.0"
+description = "Versioned drift, delayed-label performance and alert lifecycle control plane"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115",
@@ -13,14 +13,21 @@ dependencies = [
   "pydantic>=2.8",
   "numpy>=1.26",
   "scipy>=1.12",
+  "prometheus-client>=0.20",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "httpx>=0.27", "ruff>=0.6"]
+dev = ["build>=1.2", "pytest>=8.0", "httpx>=0.27", "ruff>=0.6"]
+
+[project.scripts]
+drift-reference = "monitoring.demo:main"
 
 [tool.setuptools]
 py-modules = ["drift"]
 packages = ["monitoring"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100

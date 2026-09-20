@@ -37,6 +37,26 @@ flowchart TD
 
 When a window evaluates several numeric features, KS p-values are corrected together using **Benjamini–Hochberg**. Effect-size metrics still remain visible. This reduces the “monitor 100 columns, eventually page on random p-values” failure mode.
 
+
+## Explanation drift
+
+`monitoring/explanation_drift.py` compares signed aggregate attribution profiles from a
+reviewed baseline window and a current window. It reports:
+
+- overlap between the highest-magnitude features;
+- cosine similarity of the full signed attribution profile;
+- attribution-direction agreement;
+- normalized L1 magnitude shift;
+- deterministic per-feature shift evidence and policy reasons.
+
+This detects a model relying on materially different signals even when input and prediction
+distributions appear stable. It is model-agnostic and accepts attribution aggregates from SHAP,
+permutation/sensitivity methods or another consistent explainer.
+
+The gate assumes the same model/explainer configuration, feature definitions and aggregation
+method in both windows. Explanation drift is diagnostic evidence, not proof of causal change,
+unfairness or degraded predictive performance.
+
 ## Baseline governance
 
 A baseline identity is `(model_id, model_version, feature_name, feature_kind)`. Registration stores canonical content fingerprints and never silently overwrites history:

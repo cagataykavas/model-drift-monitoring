@@ -36,3 +36,30 @@ def test_invalid_probability_and_label_are_rejected() -> None:
         performance_report(model_id="m", model_version="1", window_id="w", scores=[1.2], labels=[1])
     with pytest.raises(ValueError, match="binary"):
         performance_report(model_id="m", model_version="1", window_id="w", scores=[0.2], labels=[2])
+
+
+def test_performance_report_includes_label_coverage() -> None:
+    report = performance_report(
+        model_id="fraud",
+        model_version="1",
+        window_id="w1",
+        scores=[0.2, 0.8],
+        labels=[0, 1],
+        prediction_count=4,
+    )
+
+    assert report.prediction_count == 4
+    assert report.joined_count == 2
+    assert report.label_coverage == 0.5
+
+
+def test_prediction_count_cannot_be_smaller_than_joined_count() -> None:
+    with pytest.raises(ValueError, match="prediction_count"):
+        performance_report(
+            model_id="fraud",
+            model_version="1",
+            window_id="w1",
+            scores=[0.2, 0.8],
+            labels=[0, 1],
+            prediction_count=1,
+        )

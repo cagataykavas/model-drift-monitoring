@@ -38,6 +38,7 @@ def performance_report(
     window_id: str,
     scores: Sequence[float],
     labels: Sequence[int],
+    prediction_count: int | None = None,
     threshold: float = 0.5,
     evaluated_at: datetime | None = None,
 ) -> PerformanceReport:
@@ -49,6 +50,11 @@ def performance_report(
         raise ValueError("scores must be finite probabilities")
     if not np.isin(truth, [0, 1]).all():
         raise ValueError("labels must be binary")
+    total_predictions = len(scores) if prediction_count is None else prediction_count
+    if total_predictions < len(scores):
+        raise ValueError("prediction_count cannot be smaller than joined observations")
+    if total_predictions <= 0:
+        raise ValueError("prediction_count must be positive")
     clipped = np.clip(probability, 1e-12, 1 - 1e-12)
     predicted = (probability >= threshold).astype(int)
     true_positive = int(np.sum((predicted == 1) & (truth == 1)))
@@ -60,7 +66,9 @@ def performance_report(
         model_id=model_id,
         model_version=model_version,
         window_id=window_id,
+        prediction_count=total_predictions,
         joined_count=len(truth),
+        label_coverage=len(truth) / total_predictions,
         positive_rate=float(truth.mean()),
         mean_score=float(probability.mean()),
         brier_score=float(np.mean((probability - truth) ** 2)),

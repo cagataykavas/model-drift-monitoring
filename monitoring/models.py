@@ -95,7 +95,9 @@ class PerformanceReport:
     model_id: str
     model_version: str
     window_id: str
+    prediction_count: int
     joined_count: int
+    label_coverage: float
     positive_rate: float
     mean_score: float
     brier_score: float

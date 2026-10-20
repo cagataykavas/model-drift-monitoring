@@ -82,6 +82,8 @@ CREATE TABLE IF NOT EXISTS predictions (
     predicted_at TEXT NOT NULL,
     PRIMARY KEY(model_id, model_version, entity_id)
 );
+CREATE INDEX IF NOT EXISTS idx_predictions_as_of
+ON predictions(model_id, model_version, window_id, predicted_at, entity_id);
 
 CREATE TABLE IF NOT EXISTS labels (
     entity_id TEXT PRIMARY KEY,
@@ -364,15 +366,19 @@ class MonitoringStore:
                 "SELECT p.entity_id, p.score, p.predicted_at, l.label, l.observed_at "
                 "FROM predictions p LEFT JOIN labels l USING(entity_id) "
                 "WHERE p.model_id = ? AND p.model_version = ? AND p.window_id = ? "
-                "ORDER BY p.entity_id",
-                (model_id, model_version, window_id),
+                "AND p.predicted_at <= ? "
+                "ORDER BY p.predicted_at, p.entity_id",
+                (
+                    model_id,
+                    model_version,
+                    window_id,
+                    evaluated_at.isoformat(),
+                ),
             ).fetchall()
         scores: list[float] = []
         labels: list[int] = []
         for row in rows:
             predicted_at = datetime.fromisoformat(row["predicted_at"])
-            if predicted_at > evaluated_at:
-                raise ValueError("prediction timestamp is later than evaluation as_of")
             if row["observed_at"] is None:
                 continue
             observed_at = datetime.fromisoformat(row["observed_at"])

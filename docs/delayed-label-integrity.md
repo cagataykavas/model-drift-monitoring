@@ -31,11 +31,16 @@ POST /v1/models/credit-risk/versions/2026.10/performance/october/evaluate
 
 The evaluator:
 
-1. rejects predictions timestamped after `as_of`;
+1. includes only predictions issued on or before `as_of`;
 2. rejects labels observed before their prediction, because the outcome was already known;
 3. excludes labels observed after `as_of`;
 4. reports `prediction_count`, `joined_count` and `label_coverage`;
 5. rejects the report before persistence when coverage is below the configured floor.
+
+`prediction_count` is the number of predictions that existed at `as_of`, not the current size of
+the window. Later predictions therefore neither invalidate a historical replay nor dilute its
+coverage denominator. The store maintains a composite index over model identity, window and
+prediction time so this temporal boundary is applied before rows are joined and materialized.
 
 When `as_of` is omitted, the current UTC time is used. `minimum_label_coverage` defaults to zero
 for API compatibility; a production deployment should choose a policy from the outcome-maturity

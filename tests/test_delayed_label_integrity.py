@@ -118,11 +118,70 @@ def test_label_observed_before_prediction_is_rejected_as_leakage(
         store.evaluate_performance("credit", "v1", "oct", as_of=PREDICTED_AT + timedelta(days=2))
 
 
-def test_prediction_after_as_of_is_rejected(store: MonitoringStore) -> None:
-    store.ingest_predictions("credit", "v1", "oct", [("a", 0.9, PREDICTED_AT + timedelta(days=1))])
+def test_as_of_snapshot_excludes_future_predictions_from_coverage(
+    store: MonitoringStore,
+) -> None:
+    store.ingest_predictions(
+        "credit",
+        "v1",
+        "oct",
+        [
+            ("available", 0.9, PREDICTED_AT),
+            ("future", 0.1, PREDICTED_AT + timedelta(days=2)),
+        ],
+    )
+    store.ingest_labels(
+        [
+            ("available", 1, PREDICTED_AT + timedelta(days=1)),
+            ("future", 0, PREDICTED_AT + timedelta(days=3)),
+        ]
+    )
 
-    with pytest.raises(ValueError, match="later than evaluation as_of"):
-        store.evaluate_performance("credit", "v1", "oct", as_of=PREDICTED_AT)
+    historical = store.evaluate_performance(
+        "credit",
+        "v1",
+        "oct",
+        as_of=PREDICTED_AT + timedelta(days=1),
+        minimum_label_coverage=1.0,
+    )
+    complete = store.evaluate_performance(
+        "credit", "v1", "oct", as_of=PREDICTED_AT + timedelta(days=4)
+    )
+
+    assert historical.prediction_count == 1
+    assert historical.joined_count == 1
+    assert historical.label_coverage == 1.0
+    assert complete.prediction_count == 2
+    assert complete.joined_count == 2
+
+
+def test_as_of_snapshot_ignores_temporal_errors_in_future_predictions(
+    store: MonitoringStore,
+) -> None:
+    store.ingest_predictions(
+        "credit",
+        "v1",
+        "oct",
+        [
+            ("available", 0.9, PREDICTED_AT),
+            ("future", 0.1, PREDICTED_AT + timedelta(days=3)),
+        ],
+    )
+    store.ingest_labels(
+        [
+            ("available", 1, PREDICTED_AT + timedelta(days=1)),
+            ("future", 0, PREDICTED_AT + timedelta(days=2)),
+        ]
+    )
+
+    report = store.evaluate_performance(
+        "credit", "v1", "oct", as_of=PREDICTED_AT + timedelta(days=1)
+    )
+
+    assert report.prediction_count == 1
+    assert report.joined_count == 1
+    with pytest.raises(ValueError, match="predates its prediction"):
+        store.evaluate_performance("credit", "v1", "oct", as_of=PREDICTED_AT + timedelta(days=4))
 
 
 def test_minimum_label_coverage_gate_rejects_partial_evidence(

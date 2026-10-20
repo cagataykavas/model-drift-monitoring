@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 from monitoring.engine import apply_false_discovery_control, evaluate_feature
 from monitoring.models import AlertState, BaselineIdentity, FeatureKind
-from monitoring.store import MonitoringStore
+from monitoring.store import IngestionConflict, MonitoringStore
 
 
 class BaselineRequest(BaseModel):
@@ -168,27 +168,49 @@ def create_app(store: MonitoringStore | None = None) -> FastAPI:
 
     @application.post("/v1/predictions")
     def ingest_predictions(request: PredictionBatch) -> dict[str, int]:
-        count = monitoring_store.ingest_predictions(
-            request.model_id,
-            request.model_version,
-            request.window_id,
-            [(item.entity_id, item.score, item.predicted_at) for item in request.predictions],
-        )
+        try:
+            count = monitoring_store.ingest_predictions(
+                request.model_id,
+                request.model_version,
+                request.window_id,
+                [(item.entity_id, item.score, item.predicted_at) for item in request.predictions],
+            )
+        except IngestionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"accepted": count}
 
     @application.post("/v1/labels")
     def ingest_labels(request: LabelBatch) -> dict[str, int]:
-        count = monitoring_store.ingest_labels(
-            [(item.entity_id, item.label, item.observed_at) for item in request.labels]
-        )
+        try:
+            count = monitoring_store.ingest_labels(
+                [(item.entity_id, item.label, item.observed_at) for item in request.labels]
+            )
+        except IngestionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"accepted": count}
 
     @application.post(
         "/v1/models/{model_id}/versions/{model_version}/performance/{window_id}/evaluate"
     )
-    def evaluate_performance(model_id: str, model_version: str, window_id: str) -> dict[str, Any]:
+    def evaluate_performance(
+        model_id: str,
+        model_version: str,
+        window_id: str,
+        as_of: Annotated[datetime | None, Query()] = None,
+        minimum_label_coverage: Annotated[float, Query(ge=0, le=1)] = 0.0,
+    ) -> dict[str, Any]:
         try:
-            report = monitoring_store.evaluate_performance(model_id, model_version, window_id)
+            report = monitoring_store.evaluate_performance(
+                model_id,
+                model_version,
+                window_id,
+                as_of=as_of,
+                minimum_label_coverage=minimum_label_coverage,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return report.to_dict()

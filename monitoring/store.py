@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 from collections.abc import Sequence
@@ -81,6 +82,8 @@ CREATE TABLE IF NOT EXISTS predictions (
     predicted_at TEXT NOT NULL,
     PRIMARY KEY(model_id, model_version, entity_id)
 );
+CREATE INDEX IF NOT EXISTS idx_predictions_as_of
+ON predictions(model_id, model_version, window_id, predicted_at, entity_id);
 
 CREATE TABLE IF NOT EXISTS labels (
     entity_id TEXT PRIMARY KEY,
@@ -98,6 +101,23 @@ CREATE TABLE IF NOT EXISTS performance_runs (
     UNIQUE(model_id, model_version, window_id)
 );
 """
+
+
+class IngestionConflict(ValueError):
+    """An idempotency key was replayed with different immutable content."""
+
+
+def _required_text(name: str, value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{name} is required")
+    return normalized
+
+
+def _utc_datetime(name: str, value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{name} must be timezone-aware")
+    return value.astimezone(UTC)
 
 
 class MonitoringStore:
@@ -264,50 +284,124 @@ class MonitoringStore:
         window_id: str,
         values: Sequence[tuple[str, float, datetime]],
     ) -> int:
+        model_id = _required_text("model_id", model_id)
+        model_version = _required_text("model_version", model_version)
+        window_id = _required_text("window_id", window_id)
+        accepted = 0
         with self._transaction() as connection:
             for entity_id, score, predicted_at in values:
+                entity_id = _required_text("entity_id", entity_id)
+                numeric_score = float(score)
+                if not math.isfinite(numeric_score) or not 0 <= numeric_score <= 1:
+                    raise ValueError("score must be a finite probability")
+                predicted_at_text = _utc_datetime("predicted_at", predicted_at).isoformat()
+                existing = connection.execute(
+                    "SELECT window_id, score, predicted_at FROM predictions WHERE model_id = ? "
+                    "AND model_version = ? AND entity_id = ?",
+                    (model_id, model_version, entity_id),
+                ).fetchone()
+                candidate = (window_id, numeric_score, predicted_at_text)
+                if existing is not None:
+                    persisted = (
+                        existing["window_id"],
+                        float(existing["score"]),
+                        existing["predicted_at"],
+                    )
+                    if persisted != candidate:
+                        raise IngestionConflict(
+                            "prediction idempotency key already has different content"
+                        )
+                    continue
                 connection.execute(
                     "INSERT INTO predictions(model_id, model_version, entity_id, window_id, score, "
-                    "predicted_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
-                    (
-                        model_id,
-                        model_version,
-                        entity_id,
-                        window_id,
-                        score,
-                        predicted_at.astimezone(UTC).isoformat(),
-                    ),
+                    "predicted_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (model_id, model_version, entity_id, *candidate),
                 )
-        return len(values)
+                accepted += 1
+        return accepted
 
     def ingest_labels(self, values: Sequence[tuple[str, int, datetime]]) -> int:
+        accepted = 0
         with self._transaction() as connection:
             for entity_id, label, observed_at in values:
+                entity_id = _required_text("entity_id", entity_id)
+                if label not in {0, 1}:
+                    raise ValueError("label must be binary")
+                observed_at_text = _utc_datetime("observed_at", observed_at).isoformat()
+                existing = connection.execute(
+                    "SELECT label, observed_at FROM labels WHERE entity_id = ?", (entity_id,)
+                ).fetchone()
+                candidate = (label, observed_at_text)
+                if existing is not None:
+                    persisted = (int(existing["label"]), existing["observed_at"])
+                    if persisted != candidate:
+                        raise IngestionConflict(
+                            "label idempotency key already has different content"
+                        )
+                    continue
                 connection.execute(
-                    "INSERT INTO labels(entity_id, label, observed_at) VALUES (?, ?, ?) "
-                    "ON CONFLICT(entity_id) DO UPDATE SET label = excluded.label, "
-                    "observed_at = excluded.observed_at",
-                    (entity_id, label, observed_at.astimezone(UTC).isoformat()),
+                    "INSERT INTO labels(entity_id, label, observed_at) VALUES (?, ?, ?)",
+                    (entity_id, *candidate),
                 )
-        return len(values)
+                accepted += 1
+        return accepted
 
     def evaluate_performance(
-        self, model_id: str, model_version: str, window_id: str
+        self,
+        model_id: str,
+        model_version: str,
+        window_id: str,
+        *,
+        as_of: datetime | None = None,
+        minimum_label_coverage: float = 0.0,
     ) -> PerformanceReport:
+        model_id = _required_text("model_id", model_id)
+        model_version = _required_text("model_version", model_version)
+        window_id = _required_text("window_id", window_id)
+        evaluated_at = _utc_datetime("as_of", as_of or now_utc())
+        if not math.isfinite(minimum_label_coverage) or not 0 <= minimum_label_coverage <= 1:
+            raise ValueError("minimum_label_coverage must be between 0 and 1")
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT p.score, l.label FROM predictions p JOIN labels l USING(entity_id) "
+                "SELECT p.entity_id, p.score, p.predicted_at, l.label, l.observed_at "
+                "FROM predictions p LEFT JOIN labels l USING(entity_id) "
                 "WHERE p.model_id = ? AND p.model_version = ? AND p.window_id = ? "
-                "ORDER BY p.entity_id",
-                (model_id, model_version, window_id),
+                "AND p.predicted_at <= ? "
+                "ORDER BY p.predicted_at, p.entity_id",
+                (
+                    model_id,
+                    model_version,
+                    window_id,
+                    evaluated_at.isoformat(),
+                ),
             ).fetchall()
+        scores: list[float] = []
+        labels: list[int] = []
+        for row in rows:
+            predicted_at = datetime.fromisoformat(row["predicted_at"])
+            if row["observed_at"] is None:
+                continue
+            observed_at = datetime.fromisoformat(row["observed_at"])
+            if observed_at < predicted_at:
+                raise ValueError(f"label for entity {row['entity_id']!r} predates its prediction")
+            if observed_at <= evaluated_at:
+                scores.append(float(row["score"]))
+                labels.append(int(row["label"]))
         report = performance_report(
             model_id=model_id,
             model_version=model_version,
             window_id=window_id,
-            scores=[row["score"] for row in rows],
-            labels=[row["label"] for row in rows],
+            scores=scores,
+            labels=labels,
+            prediction_count=len(rows),
+            evaluated_at=evaluated_at,
         )
+        if report.label_coverage < minimum_label_coverage:
+            raise ValueError(
+                "label coverage below minimum: "
+                f"{report.joined_count}/{report.prediction_count} "
+                f"({report.label_coverage:.6f} < {minimum_label_coverage:.6f})"
+            )
         payload = json.dumps(report.to_dict(), sort_keys=True, separators=(",", ":"))
         with self._transaction() as connection:
             connection.execute(

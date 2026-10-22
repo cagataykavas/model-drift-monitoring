@@ -1,8 +1,45 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from math import isfinite, sqrt
+
+MAX_PROFILE_FEATURES = 10_000
+MAX_FEATURE_NAME_BYTES = 256
+
+
+@dataclass(frozen=True, slots=True)
+class ExplanationProfileIdentity:
+    model_id: str
+    model_version: str
+    explainer_id: str
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("model_id", self.model_id),
+            ("model_version", self.model_version),
+            ("explainer_id", self.explainer_id),
+        ):
+            if not value.strip():
+                raise ValueError(f"{name} is required")
+            if len(value.encode("utf-8")) > MAX_FEATURE_NAME_BYTES:
+                raise ValueError(f"{name} exceeds the byte limit")
+
+
+@dataclass(frozen=True, slots=True)
+class ExplanationBaseline:
+    baseline_id: int
+    identity: ExplanationProfileIdentity
+    profile: tuple[tuple[str, float], ...]
+    fingerprint: str
+    created_at: datetime
+    active: bool
+
+    def as_mapping(self) -> dict[str, float]:
+        return dict(self.profile)
 
 
 @dataclass(frozen=True)
@@ -47,6 +84,7 @@ class ExplanationDriftReport:
     baseline_top_features: tuple[str, ...]
     current_top_features: tuple[str, ...]
     shifts: tuple[FeatureAttributionShift, ...]
+    policy: ExplanationDriftPolicy
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -59,16 +97,31 @@ class ExplanationDriftReport:
             "baseline_top_features": list(self.baseline_top_features),
             "current_top_features": list(self.current_top_features),
             "shifts": [asdict(item) for item in self.shifts],
+            "policy": asdict(self.policy),
         }
 
 
 def _validate(values: Mapping[str, float], name: str) -> dict[str, float]:
     if len(values) < 2 or any(not feature.strip() for feature in values):
         raise ValueError(f"{name} must contain at least two named features")
-    result = {feature: float(value) for feature, value in values.items()}
+    if len(values) > MAX_PROFILE_FEATURES:
+        raise ValueError(f"{name} exceeds the feature-count limit")
+    if any(len(feature.encode("utf-8")) > MAX_FEATURE_NAME_BYTES for feature in values):
+        raise ValueError(f"{name} feature name exceeds the byte limit")
+    result = {feature: float(value) for feature, value in sorted(values.items())}
     if any(not isfinite(value) for value in result.values()):
         raise ValueError(f"{name} attributions must be finite")
     return result
+
+
+def canonical_attribution_profile(values: Mapping[str, float]) -> tuple[tuple[str, float], ...]:
+    """Validate and freeze one signed attribution profile in canonical feature order."""
+    return tuple(_validate(values, "profile").items())
+
+
+def attribution_profile_fingerprint(profile: tuple[tuple[str, float], ...]) -> str:
+    payload = json.dumps(profile, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def evaluate_explanation_drift(
@@ -146,4 +199,5 @@ def evaluate_explanation_drift(
         baseline_top_features=baseline_top,
         current_top_features=current_top,
         shifts=shifts,
+        policy=active_policy,
     )

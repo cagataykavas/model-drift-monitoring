@@ -53,6 +53,13 @@ This detects a model relying on materially different signals even when input and
 distributions appear stable. It is model-agnostic and accepts attribution aggregates from SHAP,
 permutation/sensitivity methods or another consistent explainer.
 
+Explanation baselines can also be registered through `MonitoringStore` under
+`(model_id, model_version, explainer_id)`. Profiles are canonicalized by feature name, assigned a
+SHA-256 content fingerprint, versioned without overwriting history and restored from SQLite after a
+restart. Each evaluated window atomically writes its baseline-linked report and advances the shared
+pending/open/acknowledged/resolved alert lifecycle. The persisted report includes the exact policy
+thresholds used for the decision.
+
 The gate assumes the same model/explainer configuration, feature definitions and aggregation
 method in both windows. Explanation drift is diagnostic evidence, not proof of causal change,
 unfairness or degraded predictive performance.
@@ -124,6 +131,7 @@ monitoring/models.py       typed identities, metrics, reports and alert states
 monitoring/metrics.py      numeric/categorical statistics and FDR correction
 monitoring/performance.py  delayed-label classification and calibration metrics
 monitoring/engine.py       feature evaluation and multi-feature correction
+monitoring/explanation_drift.py attribution-profile metrics and persistence contracts
 monitoring/store.py        version registry, runs, labels and alert state
 monitoring/api.py          app factory and versioned HTTP contract
 monitoring/demo.py         deterministic evidence producer
@@ -137,7 +145,7 @@ tests/                     statistics, persistence, API and lifecycle tests
 The multi-stage image builds a wheel, installs only runtime dependencies, runs as UID `10001`, owns its `/data` volume and exposes a real healthcheck. CI verifies:
 
 - Ruff lint and format;
-- 20 behavioral tests;
+- baseline, explanation-drift, alert-lifecycle and delayed-label tests;
 - sdist/wheel build;
 - isolated wheel installation and JSON evidence;
 - container build and live health probe.

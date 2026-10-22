@@ -3,12 +3,21 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from monitoring.explanation_drift import (
+    ExplanationBaseline,
+    ExplanationDriftPolicy,
+    ExplanationDriftReport,
+    ExplanationProfileIdentity,
+    attribution_profile_fingerprint,
+    canonical_attribution_profile,
+    evaluate_explanation_drift,
+)
 from monitoring.metrics import canonical_fingerprint
 from monitoring.models import (
     AlertState,
@@ -55,6 +64,36 @@ CREATE TABLE IF NOT EXISTS monitoring_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_lookup
 ON monitoring_runs(model_id, model_version, feature_name, run_id DESC);
+
+CREATE TABLE IF NOT EXISTS explanation_baseline_versions (
+    baseline_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_id TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    explainer_id TEXT NOT NULL,
+    profile_json TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    UNIQUE(model_id, model_version, explainer_id, fingerprint)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_explanation_baseline
+ON explanation_baseline_versions(model_id, model_version, explainer_id) WHERE active = 1;
+
+CREATE TABLE IF NOT EXISTS explanation_runs (
+    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    baseline_id INTEGER NOT NULL,
+    model_id TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    explainer_id TEXT NOT NULL,
+    window_id TEXT NOT NULL,
+    passed INTEGER NOT NULL,
+    report_json TEXT NOT NULL,
+    evaluated_at TEXT NOT NULL,
+    UNIQUE(model_id, model_version, explainer_id, window_id),
+    FOREIGN KEY (baseline_id) REFERENCES explanation_baseline_versions(baseline_id)
+);
+CREATE INDEX IF NOT EXISTS idx_explanation_runs_lookup
+ON explanation_runs(model_id, model_version, explainer_id, run_id DESC);
 
 CREATE TABLE IF NOT EXISTS alerts (
     alert_key TEXT PRIMARY KEY,
@@ -143,6 +182,22 @@ class MonitoringStore:
             active=bool(row["active"]),
         )
 
+    @staticmethod
+    def _explanation_baseline_from_row(row: sqlite3.Row) -> ExplanationBaseline:
+        profile = json.loads(row["profile_json"])
+        return ExplanationBaseline(
+            baseline_id=int(row["baseline_id"]),
+            identity=ExplanationProfileIdentity(
+                model_id=row["model_id"],
+                model_version=row["model_version"],
+                explainer_id=row["explainer_id"],
+            ),
+            profile=tuple((str(name), float(value)) for name, value in profile),
+            fingerprint=row["fingerprint"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            active=bool(row["active"]),
+        )
+
     def register_baseline(
         self,
         identity: BaselineIdentity,
@@ -213,6 +268,168 @@ class MonitoringStore:
         if baseline.identity.kind is not identity.kind:
             raise ValueError("requested feature kind does not match registered baseline")
         return baseline
+
+    def register_explanation_baseline(
+        self,
+        identity: ExplanationProfileIdentity,
+        profile: Mapping[str, float],
+        *,
+        created_at: datetime | None = None,
+    ) -> ExplanationBaseline:
+        canonical = canonical_attribution_profile(profile)
+        fingerprint = attribution_profile_fingerprint(canonical)
+        payload = json.dumps(canonical, separators=(",", ":"), ensure_ascii=True)
+        now = created_at or now_utc()
+        with self._transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM explanation_baseline_versions WHERE model_id = ? "
+                "AND model_version = ? AND explainer_id = ? AND fingerprint = ?",
+                (
+                    identity.model_id,
+                    identity.model_version,
+                    identity.explainer_id,
+                    fingerprint,
+                ),
+            ).fetchone()
+            if existing is not None:
+                if not existing["active"]:
+                    connection.execute(
+                        "UPDATE explanation_baseline_versions SET active = 0 WHERE model_id = ? "
+                        "AND model_version = ? AND explainer_id = ?",
+                        (identity.model_id, identity.model_version, identity.explainer_id),
+                    )
+                    connection.execute(
+                        "UPDATE explanation_baseline_versions SET active = 1 WHERE baseline_id = ?",
+                        (existing["baseline_id"],),
+                    )
+                    existing = connection.execute(
+                        "SELECT * FROM explanation_baseline_versions WHERE baseline_id = ?",
+                        (existing["baseline_id"],),
+                    ).fetchone()
+                return self._explanation_baseline_from_row(existing)
+            connection.execute(
+                "UPDATE explanation_baseline_versions SET active = 0 WHERE model_id = ? "
+                "AND model_version = ? AND explainer_id = ?",
+                (identity.model_id, identity.model_version, identity.explainer_id),
+            )
+            cursor = connection.execute(
+                "INSERT INTO explanation_baseline_versions(model_id, model_version, explainer_id, "
+                "profile_json, fingerprint, active, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)",
+                (
+                    identity.model_id,
+                    identity.model_version,
+                    identity.explainer_id,
+                    payload,
+                    fingerprint,
+                    now.astimezone(UTC).isoformat(),
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM explanation_baseline_versions WHERE baseline_id = ?",
+                (cursor.lastrowid,),
+            ).fetchone()
+        return self._explanation_baseline_from_row(row)
+
+    def active_explanation_baseline(
+        self, identity: ExplanationProfileIdentity
+    ) -> ExplanationBaseline | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM explanation_baseline_versions WHERE model_id = ? "
+                "AND model_version = ? AND explainer_id = ? AND active = 1",
+                (identity.model_id, identity.model_version, identity.explainer_id),
+            ).fetchone()
+        return None if row is None else self._explanation_baseline_from_row(row)
+
+    @staticmethod
+    def _explanation_alert_identity(identity: ExplanationProfileIdentity) -> BaselineIdentity:
+        return BaselineIdentity(
+            identity.model_id,
+            identity.model_version,
+            f"explanation/{identity.explainer_id}",
+            FeatureKind.NUMERIC,
+        )
+
+    def evaluate_explanation_window(
+        self,
+        identity: ExplanationProfileIdentity,
+        current: Mapping[str, float],
+        *,
+        window_id: str,
+        policy: ExplanationDriftPolicy | None = None,
+        open_after: int = 2,
+        resolve_after: int = 2,
+        evaluated_at: datetime | None = None,
+    ) -> tuple[ExplanationDriftReport, dict[str, Any] | None]:
+        if not window_id.strip():
+            raise ValueError("window_id is required")
+        baseline = self.active_explanation_baseline(identity)
+        if baseline is None:
+            raise ValueError("explanation baseline not registered")
+        report = evaluate_explanation_drift(
+            baseline.as_mapping(),
+            current,
+            policy=policy,
+        )
+        now = evaluated_at or now_utc()
+        report_payload = {
+            **report.to_dict(),
+            "baseline_id": baseline.baseline_id,
+            "baseline_fingerprint": baseline.fingerprint,
+            "window_id": window_id,
+            "evaluated_at": now.astimezone(UTC).isoformat(),
+        }
+        severity = Severity.STABLE if report.passed else Severity.ALERT
+        alert_identity = self._explanation_alert_identity(identity)
+        with self._transaction() as connection:
+            try:
+                connection.execute(
+                    "INSERT INTO explanation_runs(baseline_id, model_id, model_version, "
+                    "explainer_id, window_id, passed, report_json, evaluated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        baseline.baseline_id,
+                        identity.model_id,
+                        identity.model_version,
+                        identity.explainer_id,
+                        window_id,
+                        int(report.passed),
+                        json.dumps(report_payload, sort_keys=True, separators=(",", ":")),
+                        now.astimezone(UTC).isoformat(),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("window_id has already been evaluated for this explainer") from exc
+            alert = self._observe_alert(
+                connection,
+                alert_identity,
+                severity,
+                open_after=open_after,
+                resolve_after=resolve_after,
+                observed_at=now,
+            )
+        return report, alert
+
+    def recent_explanation_runs(
+        self, identity: ExplanationProfileIdentity, *, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT run_id, report_json FROM explanation_runs WHERE model_id = ? "
+                "AND model_version = ? AND explainer_id = ? ORDER BY run_id DESC LIMIT ?",
+                (
+                    identity.model_id,
+                    identity.model_version,
+                    identity.explainer_id,
+                    max(1, min(limit, 200)),
+                ),
+            ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            value = json.loads(row["report_json"])
+            value["run_id"] = row["run_id"]
+            results.append(value)
+        return results
 
     def record_feature_report(self, report: FeatureReport) -> int:
         payload = json.dumps(report.to_dict(), sort_keys=True, separators=(",", ":"))
@@ -324,8 +541,9 @@ class MonitoringStore:
             )
         return report
 
-    def observe_alert(
-        self,
+    @staticmethod
+    def _observe_alert(
+        connection: sqlite3.Connection,
         identity: BaselineIdentity,
         severity: Severity,
         *,
@@ -335,80 +553,96 @@ class MonitoringStore:
     ) -> dict[str, Any] | None:
         now = observed_at or now_utc()
         key = f"{identity.model_id}:{identity.model_version}:{identity.feature_name}"
-        with self._transaction() as connection:
-            row = connection.execute("SELECT * FROM alerts WHERE alert_key = ?", (key,)).fetchone()
-            breach = severity in {Severity.WARNING, Severity.ALERT}
-            if row is None and not breach:
-                return None
-            if row is None:
-                breaches = 1
-                state = AlertState.OPEN if breaches >= open_after else AlertState.PENDING
-                connection.execute(
-                    "INSERT INTO alerts(alert_key, model_id, model_version, feature_name, state, "
-                    "severity, consecutive_breaches, consecutive_stable, occurrences, first_seen_at, "
-                    "last_seen_at, resolved_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
-                    (
-                        key,
-                        identity.model_id,
-                        identity.model_version,
-                        identity.feature_name,
-                        state,
-                        severity,
-                        breaches,
-                        int(state is AlertState.OPEN),
-                        now.isoformat(),
-                        now.isoformat(),
-                        None,
-                    ),
-                )
-            else:
-                breaches = int(row["consecutive_breaches"]) + 1 if breach else 0
-                stable = 0 if breach else int(row["consecutive_stable"]) + 1
-                state = AlertState(row["state"])
-                occurrences = int(row["occurrences"])
-                resolved_at = row["resolved_at"]
-                if (
-                    breach
-                    and breaches >= open_after
-                    and state
-                    in {
-                        AlertState.PENDING,
-                        AlertState.RESOLVED,
-                    }
-                ):
-                    state = AlertState.OPEN
-                    occurrences += 1
-                    resolved_at = None
-                elif (
-                    not breach
-                    and stable >= resolve_after
-                    and state
-                    in {
-                        AlertState.OPEN,
-                        AlertState.ACKNOWLEDGED,
-                    }
-                ):
-                    state = AlertState.RESOLVED
-                    resolved_at = now.isoformat()
-                connection.execute(
-                    "UPDATE alerts SET state = ?, severity = ?, consecutive_breaches = ?, "
-                    "consecutive_stable = ?, occurrences = ?, last_seen_at = ?, resolved_at = ? "
-                    "WHERE alert_key = ?",
-                    (
-                        state,
-                        severity,
-                        breaches,
-                        stable,
-                        occurrences,
-                        now.isoformat(),
-                        resolved_at,
-                        key,
-                    ),
-                )
-            result = connection.execute(
-                "SELECT * FROM alerts WHERE alert_key = ?", (key,)
-            ).fetchone()
+        row = connection.execute("SELECT * FROM alerts WHERE alert_key = ?", (key,)).fetchone()
+        breach = severity in {Severity.WARNING, Severity.ALERT}
+        if row is None and not breach:
+            return None
+        if row is None:
+            breaches = 1
+            state = AlertState.OPEN if breaches >= open_after else AlertState.PENDING
+            connection.execute(
+                "INSERT INTO alerts(alert_key, model_id, model_version, feature_name, state, "
+                "severity, consecutive_breaches, consecutive_stable, occurrences, first_seen_at, "
+                "last_seen_at, resolved_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
+                (
+                    key,
+                    identity.model_id,
+                    identity.model_version,
+                    identity.feature_name,
+                    state,
+                    severity,
+                    breaches,
+                    int(state is AlertState.OPEN),
+                    now.isoformat(),
+                    now.isoformat(),
+                    None,
+                ),
+            )
+        else:
+            breaches = int(row["consecutive_breaches"]) + 1 if breach else 0
+            stable = 0 if breach else int(row["consecutive_stable"]) + 1
+            state = AlertState(row["state"])
+            occurrences = int(row["occurrences"])
+            resolved_at = row["resolved_at"]
+            if (
+                breach
+                and breaches >= open_after
+                and state
+                in {
+                    AlertState.PENDING,
+                    AlertState.RESOLVED,
+                }
+            ):
+                state = AlertState.OPEN
+                occurrences += 1
+                resolved_at = None
+            elif (
+                not breach
+                and stable >= resolve_after
+                and state
+                in {
+                    AlertState.OPEN,
+                    AlertState.ACKNOWLEDGED,
+                }
+            ):
+                state = AlertState.RESOLVED
+                resolved_at = now.isoformat()
+            connection.execute(
+                "UPDATE alerts SET state = ?, severity = ?, consecutive_breaches = ?, "
+                "consecutive_stable = ?, occurrences = ?, last_seen_at = ?, resolved_at = ? "
+                "WHERE alert_key = ?",
+                (
+                    state,
+                    severity,
+                    breaches,
+                    stable,
+                    occurrences,
+                    now.isoformat(),
+                    resolved_at,
+                    key,
+                ),
+            )
+        result = connection.execute("SELECT * FROM alerts WHERE alert_key = ?", (key,)).fetchone()
         return dict(result)
+
+    def observe_alert(
+        self,
+        identity: BaselineIdentity,
+        severity: Severity,
+        *,
+        open_after: int = 2,
+        resolve_after: int = 2,
+        observed_at: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        with self._transaction() as connection:
+            return self._observe_alert(
+                connection,
+                identity,
+                severity,
+                open_after=open_after,
+                resolve_after=resolve_after,
+                observed_at=observed_at,
+            )
 
     def acknowledge_alert(self, alert_key: str, *, acknowledged_at: datetime | None = None) -> dict:
         now = acknowledged_at or now_utc()
